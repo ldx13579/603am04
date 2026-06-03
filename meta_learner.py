@@ -109,47 +109,92 @@ class TaskDistribution:
 class PatternChangeDetector:
     """负载模式变化检测器
 
-    使用滑动窗口统计量检测负载模式漂移:
-    - 均值漂移检测 (CUSUM风格)
-    - 方差变化检测
-    - 到达率分布变化 (基于窗口KL散度近似)
+    多维度综合检测:
+    - 总负载均值漂移 (CUSUM风格)
+    - 总负载方差变化
+    - 各服务器负载分布差异 (Gini系数变化 + 负载不均衡度漂移)
+    - 服务器间负载相关性变化
 
-    当检测到显著漂移时, 触发回调通知元学习器进行快速适应。
+    综合漂移分数融合以上维度, 超过阈值时触发适应。
     """
 
     def __init__(self, window_size=24, drift_threshold=2.5,
-                 variance_threshold=3.0, cooldown_steps=12):
+                 variance_threshold=3.0, cooldown_steps=12,
+                 num_servers=3):
         self.window_size = window_size
         self.drift_threshold = drift_threshold
         self.variance_threshold = variance_threshold
         self.cooldown_steps = cooldown_steps
+        self.num_servers = num_servers
 
+        # 总负载历史
         self.history = deque(maxlen=window_size * 2)
         self.reference_mean = None
         self.reference_std = None
+
+        # 各服务器负载分布历史
+        self.server_histories = [
+            deque(maxlen=window_size * 2) for _ in range(num_servers)
+        ]
+        self.reference_gini = None
+        self.reference_imbalance = None
+
         self.steps_since_last_trigger = cooldown_steps
         self.drift_detected = False
         self.drift_score = 0.0
+        self.distribution_drift_score = 0.0
 
     def reset(self):
         """重置检测器状态"""
         self.history.clear()
+        for h in self.server_histories:
+            h.clear()
         self.reference_mean = None
         self.reference_std = None
+        self.reference_gini = None
+        self.reference_imbalance = None
         self.steps_since_last_trigger = self.cooldown_steps
         self.drift_detected = False
         self.drift_score = 0.0
+        self.distribution_drift_score = 0.0
 
-    def update(self, load_value):
+    @staticmethod
+    def _compute_gini(values):
+        """计算Gini系数衡量负载分布不均匀度 (0=完全均匀, 1=完全集中)"""
+        values = np.array(values, dtype=np.float64)
+        if len(values) == 0 or np.sum(values) == 0:
+            return 0.0
+        sorted_v = np.sort(values)
+        n = len(sorted_v)
+        cumsum = np.cumsum(sorted_v)
+        return (2.0 * np.sum((np.arange(1, n + 1) * sorted_v)) /
+                (n * np.sum(sorted_v)) - (n + 1) / n)
+
+    @staticmethod
+    def _compute_imbalance(values):
+        """计算负载不均衡度: max/mean比率"""
+        values = np.array(values, dtype=np.float64)
+        mean_v = np.mean(values)
+        if mean_v < 1e-6:
+            return 1.0
+        return np.max(values) / mean_v
+
+    def update(self, load_value, per_server_loads=None):
         """输入新的负载观测值, 返回是否检测到模式变化
 
         Args:
-            load_value: 当前步的负载值(到达请求数或队列长度)
+            load_value: 当前步的总负载值
+            per_server_loads: 各服务器负载列表 [q0, q1, q2]
+                若提供则启用分布差异检测
 
         Returns:
             drift_detected: bool, 是否检测到模式变化
         """
         self.history.append(load_value)
+        if per_server_loads is not None:
+            for i, load in enumerate(per_server_loads[:self.num_servers]):
+                self.server_histories[i].append(load)
+
         self.steps_since_last_trigger += 1
         self.drift_detected = False
 
@@ -173,24 +218,41 @@ class PatternChangeDetector:
         new_std = np.std(new_window)
         var_ratio = new_std / self.reference_std if self.reference_std > 0 else 1.0
 
-        # 综合漂移分数
-        self.drift_score = max(
+        # 服务器负载分布差异检测
+        self.distribution_drift_score = 0.0
+        if per_server_loads is not None and all(
+            len(h) >= self.window_size for h in self.server_histories
+        ):
+            dist_score = self._compute_distribution_drift()
+            self.distribution_drift_score = dist_score
+
+        # 综合漂移分数 (融合总负载漂移 + 分布差异)
+        load_drift = max(
             mean_z_score / self.drift_threshold,
             (var_ratio if var_ratio > 1 else 1.0 / max(var_ratio, 1e-6))
             / self.variance_threshold,
         )
+        self.drift_score = max(load_drift, self.distribution_drift_score)
 
         if self.steps_since_last_trigger < self.cooldown_steps:
             return False
 
-        if mean_z_score > self.drift_threshold or var_ratio > self.variance_threshold:
+        # 触发条件: 总负载漂移 OR 分布差异超阈值
+        triggered = (
+            mean_z_score > self.drift_threshold
+            or var_ratio > self.variance_threshold
+            or self.distribution_drift_score > 1.0
+        )
+
+        if triggered:
             self.drift_detected = True
             self.steps_since_last_trigger = 0
             self.reference_mean = new_mean
             self.reference_std = max(new_std, 1e-6)
+            self._update_distribution_reference()
             return True
 
-        # 渐进更新参考值 (缓慢跟踪非突变的漂移)
+        # 渐进更新参考值
         alpha = 0.05
         self.reference_mean = (1 - alpha) * self.reference_mean + alpha * new_mean
         self.reference_std = max(
@@ -199,9 +261,102 @@ class PatternChangeDetector:
 
         return False
 
+    def _compute_distribution_drift(self):
+        """计算服务器间负载分布的漂移分数
+
+        综合三个维度:
+        1. Gini系数变化: 负载集中度是否发生变化
+        2. 不均衡度变化: 最大负载/平均负载比率是否异常
+        3. 服务器排序变化: 负载排名是否翻转 (新模式可能改变瓶颈服务器)
+        """
+        mid = self.window_size
+        scores = []
+
+        # 各窗口内各服务器的平均负载
+        old_server_means = []
+        new_server_means = []
+        for i in range(self.num_servers):
+            h = list(self.server_histories[i])
+            if len(h) < mid:
+                return 0.0
+            old_part = h[:mid]
+            new_part = h[mid:]
+            if not old_part or not new_part:
+                return 0.0
+            old_server_means.append(np.mean(old_part))
+            new_server_means.append(np.mean(new_part))
+
+        # 1. Gini系数变化
+        old_gini = self._compute_gini(old_server_means)
+        new_gini = self._compute_gini(new_server_means)
+
+        if self.reference_gini is None:
+            self.reference_gini = old_gini
+
+        gini_change = abs(new_gini - self.reference_gini) / max(self.reference_gini + 0.1, 0.1)
+        scores.append(gini_change)
+
+        # 2. 不均衡度变化
+        old_imbalance = self._compute_imbalance(old_server_means)
+        new_imbalance = self._compute_imbalance(new_server_means)
+
+        if self.reference_imbalance is None:
+            self.reference_imbalance = old_imbalance
+
+        imbalance_change = abs(new_imbalance - self.reference_imbalance) / max(self.reference_imbalance, 1.0)
+        scores.append(imbalance_change)
+
+        # 3. 负载排序变化 (Kendall tau-like)
+        old_rank = np.argsort(old_server_means)
+        new_rank = np.argsort(new_server_means)
+        rank_change = np.sum(old_rank != new_rank) / self.num_servers
+        scores.append(rank_change)
+
+        # 4. 各服务器负载比例变化
+        old_total = max(sum(old_server_means), 1e-6)
+        new_total = max(sum(new_server_means), 1e-6)
+        old_proportions = np.array(old_server_means) / old_total
+        new_proportions = np.array(new_server_means) / new_total
+        proportion_shift = np.sum(np.abs(new_proportions - old_proportions))
+        scores.append(proportion_shift)
+
+        # 加权综合 (Gini变化和比例偏移权重较高)
+        weights = [0.3, 0.2, 0.2, 0.3]
+        combined = sum(s * w for s, w in zip(scores, weights))
+        return combined / 0.3  # 归一化使得>1.0表示显著变化
+
+    def _update_distribution_reference(self):
+        """触发后更新分布参考值"""
+        mid = self.window_size
+        new_means = []
+        for i in range(self.num_servers):
+            h = list(self.server_histories[i])
+            if len(h) > mid:
+                new_means.append(np.mean(h[mid:]))
+            else:
+                new_means.append(np.mean(h) if h else 0)
+        self.reference_gini = self._compute_gini(new_means)
+        self.reference_imbalance = self._compute_imbalance(new_means)
+
     def get_recent_trace(self):
         """获取检测器中累积的近期负载数据作为adaptation trace"""
         return np.array(list(self.history), dtype=np.int32)
+
+    def get_extended_trace(self, extra_history=None):
+        """获取扩充后的近期负载数据, 合并额外历史以保障适应效果
+
+        Args:
+            extra_history: 额外的历史负载数据 (deque or list)
+
+        Returns:
+            合并后的trace, 优先使用更多数据以捕捉完整模式
+        """
+        recent = list(self.history)
+        if extra_history:
+            extra = list(extra_history)
+            combined = extra + recent
+            return np.array(combined, dtype=np.int32)
+        return np.array(recent, dtype=np.int32)
 
 
 class ReptileMetaLearner:
@@ -240,9 +395,13 @@ class ReptileMetaLearner:
             window_size=detect_window,
             drift_threshold=detect_threshold,
             cooldown_steps=detect_cooldown,
+            num_servers=self.num_servers,
         ) if auto_detect else None
         self._last_adapted_agent = None
         self._auto_adapt_count = 0
+
+        # 扩充历史数据缓冲: 保留更长的负载历史以备适应时使用
+        self._load_history_buffer = deque(maxlen=detect_window * 4)
 
     def _create_agent(self):
         """创建新的MADDQN agent实例并加载元权重"""
@@ -407,15 +566,19 @@ class ReptileMetaLearner:
         self._last_adapted_agent = agent
         return agent
 
-    def observe_and_adapt(self, load_value, current_agent=None):
+    def observe_and_adapt(self, load_value, current_agent=None,
+                          per_server_loads=None):
         """观测新负载值, 自动检测模式变化并触发适应
 
-        在每步环境交互时调用此方法, 输入当前步的总负载。
-        检测到模式漂移时自动使用累积的近期数据进行fast_adapt。
+        在每步环境交互时调用此方法。检测到模式漂移时,
+        合并检测器窗口数据和扩充历史缓冲进行fast_adapt,
+        保障适应过程使用更充分的历史数据。
 
         Args:
-            load_value: 当前步的负载观测值 (如总到达请求数)
-            current_agent: 当前使用的agent (适应后会替换)
+            load_value: 当前步的总负载观测值
+            current_agent: 当前使用的agent
+            per_server_loads: 各服务器负载列表 [q0, q1, q2],
+                提供后启用分布差异检测
 
         Returns:
             (adapted, agent): adapted为是否触发了适应, agent为当前应使用的agent
@@ -423,12 +586,19 @@ class ReptileMetaLearner:
         if not self.auto_detect or self.detector is None:
             return False, current_agent
 
-        drift = self.detector.update(load_value)
+        # 记录到扩充历史缓冲 (比检测器窗口更长)
+        self._load_history_buffer.append(load_value)
+
+        drift = self.detector.update(load_value, per_server_loads)
 
         if drift:
-            recent_trace = self.detector.get_recent_trace()
-            if len(recent_trace) >= 6:
-                adapted_agent = self.fast_adapt(recent_trace, self.inner_episodes)
+            # 使用扩充历史数据: 合并检测器窗口 + 额外历史缓冲
+            adapt_trace = self.detector.get_extended_trace(
+                extra_history=self._load_history_buffer
+            )
+            # 至少需要6步数据才有意义
+            if len(adapt_trace) >= 6:
+                adapted_agent = self.fast_adapt(adapt_trace, self.inner_episodes)
                 self._auto_adapt_count += 1
                 return True, adapted_agent
 

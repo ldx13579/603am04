@@ -179,6 +179,11 @@ class ControllerState:
     def validate_state_sync(self, data: 'LoadData') -> Optional[str]:
         """验证客户端提交的状态与服务端是否一致
 
+        队列偏差阈值根据服务器类型动态调整:
+        - 高性能服务器 (p_max >= 250W): 阈值=8 (处理能力强, 队列波动大)
+        - 标准服务器 (p_max 150-250W): 阈值=5 (中等容忍度)
+        - 低功耗服务器 (p_max < 150W): 阈值=3 (处理能力弱, 偏差敏感)
+
         Returns:
             None if valid, error message string if inconsistent
         """
@@ -195,11 +200,13 @@ class ControllerState:
             for i, (expected, actual) in enumerate(
                 zip(data.expected_queues, actual_queues)
             ):
-                if abs(expected - actual) > 5:
+                threshold = self._get_queue_deviation_threshold(i)
+                if abs(expected - actual) > threshold:
                     return (
-                        f"Queue state mismatch on server {i}: "
-                        f"client expects {expected}, actual is {actual}. "
-                        f"State divergence detected."
+                        f"Queue state mismatch on server {i} "
+                        f"({self.env.server_configs[i]['name']}): "
+                        f"client expects {expected}, actual is {actual}, "
+                        f"threshold={threshold}. State divergence detected."
                     )
 
         if len(data.server_loads) != self.env.num_servers:
@@ -209,6 +216,30 @@ class ControllerState:
             )
 
         return None
+
+    def _get_queue_deviation_threshold(self, server_idx: int) -> int:
+        """根据服务器类型动态计算队列偏差容忍阈值
+
+        高性能服务器处理速率快, 队列变化剧烈, 需要更大容忍;
+        低功耗服务器处理速率慢, 队列变化缓慢, 偏差应敏感。
+        """
+        cfg = self.env.server_configs[server_idx]
+        p_max = cfg["p_max"]
+        base_rate = cfg["base_service_rate"]
+
+        if p_max >= 250:
+            base_threshold = 8
+        elif p_max >= 150:
+            base_threshold = 5
+        else:
+            base_threshold = 3
+
+        # 根据当前频率进一步调整: 高频时服务快队列变化大
+        server = self.env.servers[server_idx]
+        freq_factor = cfg["freq_multipliers"][server.current_freq]
+        dynamic_threshold = int(base_threshold * (0.8 + 0.4 * freq_factor))
+
+        return max(2, dynamic_threshold)
 
     def step_environment(self, arrivals: Optional[int] = None):
         """推进环境一步, 返回指标"""
@@ -236,11 +267,13 @@ class ControllerState:
                     / self.baseline_energy_wh * 100.0
                 )
 
-            # 自动模式检测: 输入总到达负载
+            # 自动模式检测: 输入总负载 + 各服务器负载分布
             total_load = sum(info["queues"])
+            per_server_loads = info["queues"]
             if self.meta_learner:
                 adapted, new_agent = self.meta_learner.observe_and_adapt(
-                    total_load, self.agent
+                    total_load, self.agent,
+                    per_server_loads=per_server_loads,
                 )
                 if adapted and new_agent is not None:
                     self.agent = new_agent
