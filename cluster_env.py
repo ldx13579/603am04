@@ -48,6 +48,12 @@ class ServerState:
         self.max_queue = 50
         self.recovery_phase = 0
         self.recovery_duration = 3
+
+        # 在线迁移相关
+        self.sustained_overload_counter = 0
+        self.incoming_migration_buffer = deque()  # (arrival_step, count, source_id)
+        self.request_sources = {}  # {source_server_id: count} 按来源分类计数
+
         self.reset()
 
     def reset(self):
@@ -60,6 +66,9 @@ class ServerState:
         self.is_failed = False
         self.failure_countdown = 0
         self.recovery_phase = 0
+        self.sustained_overload_counter = 0
+        self.incoming_migration_buffer = deque()
+        self.request_sources = {}
 
     def get_service_rate_factor(self):
         """恢复初期的服务速率限制: 逐步从50%提升到100%"""
@@ -68,11 +77,36 @@ class ServerState:
             return 0.5 + 0.5 * progress
         return 1.0
 
+    def get_pending_migration_count(self):
+        """返回正在迁移中尚未到达的请求总数"""
+        return sum(count for _, count, _ in self.incoming_migration_buffer)
+
+    def get_local_request_ratio(self):
+        """本地原生请求占比 (非迁移来的)"""
+        total = sum(self.request_sources.values())
+        if total == 0:
+            return 1.0
+        local = self.request_sources.get(-1, 0)  # -1 表示本地请求
+        return local / total
+
 
 class ClusterEnv:
-    """异构三服务器集群环境
+    """异构三服务器集群环境 (含在线迁移决策)
 
-    特性: 通信延迟、服务器故障、负载均衡、外部trace驱动
+    动作空间 (每台服务器6个动作):
+        0: 降频
+        1: 维持频率
+        2: 升频
+        3: 触发迁移 (低强度)
+        4: 触发迁移 (中强度)
+        5: 触发迁移 (高强度)
+
+    迁移比例根据源队列长度和目标剩余容量动态计算:
+        base_fraction = {3: 0.2, 4: 0.4, 5: 0.6}
+        actual_fraction = base_fraction * (src_queue / max_queue) * (target_remaining / max_queue)
+
+    迁移延迟根据系统负载动态调整:
+        delay = base_delay + int(system_load_ratio * 2)
     """
 
     def __init__(self, server_configs=None, trace=None,
@@ -101,18 +135,23 @@ class ClusterEnv:
 
         self.redirect_log = []
 
+        # 迁移参数
+        self.migration_base_delay = 1
+        self.migration_energy_per_request = 0.5  # 每请求迁移能耗(瓦特)
+        self.overload_threshold = 0.6  # 队列占比超此值计为过载
+
     @property
     def local_state_dim(self):
-        # 4 local + 2 global + 2*(num_servers-1) peer states
-        return 4 + 2 + 2 * (self.num_servers - 1)
+        # 6 local + 2 global + 3*(num_servers-1) peer states
+        return 6 + 2 + 3 * (self.num_servers - 1)
 
     @property
     def joint_state_dim(self):
-        return self.num_servers * 4 + 2
+        return self.num_servers * 6 + 2
 
     @property
     def action_dim(self):
-        return 3
+        return 6
 
     def reset(self):
         for server in self.servers:
@@ -136,16 +175,21 @@ class ClusterEnv:
             avg_load,
             time_of_day,
             server.current_freq / (self.freq_levels - 1),
+            server.sustained_overload_counter / 10.0,
+            server.get_local_request_ratio(),
+            # 全局特征
             total_queue / (self.max_queue * self.num_servers),
             num_active / self.num_servers,
         ]
 
+        # 邻居信息 (每个邻居3个特征)
         for j in range(self.num_servers):
             if j == idx:
                 continue
             peer = self.servers[j]
             state.append(peer.queue_length / self.max_queue)
             state.append(peer.current_freq / (self.freq_levels - 1))
+            state.append(peer.sustained_overload_counter / 10.0)
 
         return np.array(state, dtype=np.float32)
 
@@ -159,6 +203,8 @@ class ClusterEnv:
                 avg_load,
                 time_of_day,
                 server.current_freq / (self.freq_levels - 1),
+                server.sustained_overload_counter / 10.0,
+                server.get_local_request_ratio(),
             ])
         total_queue = sum(s.queue_length for s in self.servers)
         num_active = sum(1 for s in self.servers if not s.is_failed)
@@ -172,23 +218,144 @@ class ClusterEnv:
             "local_states": [self._get_local_state(i) for i in range(self.num_servers)],
         }
 
+    def _get_system_load_ratio(self):
+        """当前系统整体负载比例"""
+        total_queue = sum(s.queue_length for s in self.servers)
+        total_capacity = self.max_queue * self.num_servers
+        return total_queue / max(total_capacity, 1)
+
+    def _compute_migration_delay(self):
+        """根据系统负载动态调整迁移延迟步数"""
+        load_ratio = self._get_system_load_ratio()
+        return self.migration_base_delay + int(load_ratio * 2)
+
+    def _compute_dynamic_migration_count(self, action, source_idx, target_idx):
+        """根据源队列长度和目标剩余容量动态计算迁移数量
+
+        base_fraction由动作决定基础迁移强度
+        实际迁移量 = base_fraction * src_queue * (target_remaining / max_queue)
+        """
+        base_fractions = {3: 0.2, 4: 0.4, 5: 0.6}
+        base_frac = base_fractions[action]
+
+        src_queue = self.servers[source_idx].queue_length
+        target_remaining = self.max_queue - self.servers[target_idx].queue_length
+        target_capacity_ratio = target_remaining / self.max_queue
+
+        # 动态比例: 源越满迁移动机越强, 目标越空接收能力越大
+        effective_frac = base_frac * (src_queue / self.max_queue) * target_capacity_ratio
+        migrate_count = max(1, int(src_queue * effective_frac))
+        migrate_count = min(migrate_count, src_queue, target_remaining)
+        return migrate_count
+
+    def _execute_migrations(self, actions):
+        """处理迁移动作 (actions 3/4/5)"""
+        migration_info = []
+        delay = self._compute_migration_delay()
+
+        for i, server in enumerate(self.servers):
+            if server.is_failed or actions[i] < 3:
+                continue
+            if server.queue_length <= 0:
+                continue
+
+            # 找最空闲的活跃邻居
+            peers = [j for j in range(self.num_servers)
+                     if j != i and not self.servers[j].is_failed]
+            if not peers:
+                continue
+
+            target_idx = min(peers, key=lambda j: self.servers[j].queue_length)
+
+            # 如果目标已经比源还满, 不迁移
+            if self.servers[target_idx].queue_length >= server.queue_length:
+                continue
+
+            migrate_count = self._compute_dynamic_migration_count(
+                actions[i], i, target_idx
+            )
+            if migrate_count <= 0:
+                continue
+
+            # 源立即减少
+            server.queue_length -= migrate_count
+            # 更新源的请求来源计数
+            local_in_source = server.request_sources.get(-1, server.queue_length)
+            removed_local = min(migrate_count, local_in_source)
+            server.request_sources[-1] = max(0, local_in_source - removed_local)
+
+            # 目标延迟接收
+            arrival_step = self.time_step + delay
+            self.servers[target_idx].incoming_migration_buffer.append(
+                (arrival_step, migrate_count, i)
+            )
+
+            migration_info.append({
+                "step": self.time_step,
+                "from": i,
+                "to": target_idx,
+                "count": migrate_count,
+                "delay": delay,
+                "reason": "agent_migration",
+            })
+
+        self.redirect_log.extend(migration_info)
+        return migration_info
+
+    def _deliver_migration_buffer(self):
+        """投递已完成迁移传输的请求"""
+        for server_idx, server in enumerate(self.servers):
+            while (server.incoming_migration_buffer and
+                   server.incoming_migration_buffer[0][0] <= self.time_step):
+                _, count, source_id = server.incoming_migration_buffer.popleft()
+                delivered = min(count, self.max_queue - server.queue_length)
+                server.queue_length += delivered
+                # 按来源记录
+                server.request_sources[source_id] = \
+                    server.request_sources.get(source_id, 0) + delivered
+
+    def _update_overload_counters(self):
+        """更新持续过载计数器"""
+        for server in self.servers:
+            if server.queue_length / self.max_queue > self.overload_threshold:
+                server.sustained_overload_counter += 1
+            else:
+                server.sustained_overload_counter = max(
+                    0, server.sustained_overload_counter - 1
+                )
+
     def step(self, actions):
         """
         actions: [action_server0, action_server1, action_server2]
+        每个action取值0-5
         """
+        # 1. 频率调整 (仅动作0/1/2调频, 3/4/5不改频率)
         for i, server in enumerate(self.servers):
             server.prev_freq = server.current_freq
-            if not server.is_failed:
+            if not server.is_failed and actions[i] <= 2:
                 if actions[i] == 0:
                     server.current_freq = max(0, server.current_freq - 1)
                 elif actions[i] == 2:
                     server.current_freq = min(self.freq_levels - 1, server.current_freq + 1)
 
+        # 2. 执行迁移动作
+        migration_info = self._execute_migrations(actions)
+
+        # 3. 投递已完成的迁移请求
+        self._deliver_migration_buffer()
+
+        # 4. 请求到达与分发
         arrivals = self._get_arrivals()
         self._distribute_requests(arrivals)
         self._deliver_delayed_requests()
+
+        # 5. 故障模拟
         self._simulate_failures()
 
+        # 6. 更新过载计数器
+        self._update_overload_counters()
+
+        # 7. 服务处理
         powers = []
         step_response_time = 0.0
         step_served = 0
@@ -210,6 +377,17 @@ class ClusterEnv:
                     max_process = min(max_process, max(1, capacity_limit))
                 processed = min(max_process, server.queue_length)
                 server.queue_length -= processed
+
+                # 按比例减少各来源计数
+                total_src = sum(server.request_sources.values())
+                if total_src > 0:
+                    for src_id in list(server.request_sources.keys()):
+                        ratio = server.request_sources[src_id] / total_src
+                        remove = int(processed * ratio)
+                        server.request_sources[src_id] = max(
+                            0, server.request_sources[src_id] - remove
+                        )
+
                 avg_wait = server.queue_length / max(service_rate * self.dt, 1e-6)
                 step_response_time += processed * (1.0 / max(service_rate, 1e-6) + avg_wait)
                 step_served += processed
@@ -232,6 +410,7 @@ class ClusterEnv:
             self.total_response_time += step_response_time
             self.total_requests_served += step_served
 
+        # 8. 计算奖励
         rewards_per_server = []
         for i, server in enumerate(self.servers):
             cfg = self.server_configs[i]
@@ -249,13 +428,31 @@ class ClusterEnv:
             if freq_diff > 0:
                 r -= 0.2 * freq_diff
 
+            # 迁移奖励/惩罚
+            server_migrations = [m for m in migration_info if m["from"] == i]
+            if server_migrations:
+                total_migrated = sum(m["count"] for m in server_migrations)
+                # 迁移能耗惩罚
+                migration_energy_penalty = (
+                    total_migrated * self.migration_energy_per_request / cfg["p_max"] * 0.5
+                )
+                r -= migration_energy_penalty
+
+                # 迁移成功奖励: 迁移后队列降到SLA以下
+                if server.queue_length < self.sla_threshold:
+                    r += 0.5
+
+                # 过早迁移惩罚: 过载计数不足时不该迁移
+                if server.sustained_overload_counter < 2:
+                    r -= 1.0
+
             rewards_per_server.append(r)
 
+        # 负载均衡惩罚
         queue_lengths = [s.queue_length for s in self.servers]
         balance_penalty = -np.std(queue_lengths) / self.max_queue * 0.5
 
-        # 协作奖励: 服务器频率决策互补时给予奖励
-        # 高负载服务器升频 + 低负载服务器降频 = 协同工作
+        # 协作奖励
         cooperation_reward = 0.0
         active_servers = [(i, s) for i, s in enumerate(self.servers) if not s.is_failed]
         if len(active_servers) >= 2:
@@ -263,12 +460,10 @@ class ClusterEnv:
             for i, server in active_servers:
                 is_overloaded = server.queue_length > avg_queue
                 freq_change = server.current_freq - server.prev_freq
-                # 高负载升频或低负载降频都是协作行为
                 if is_overloaded and freq_change > 0:
                     cooperation_reward += 0.3
                 elif not is_overloaded and freq_change < 0:
                     cooperation_reward += 0.3
-            # 全体频率配置覆盖多层级时(异构分工), 额外奖励
             freq_set = set(s.current_freq for _, s in active_servers)
             if len(freq_set) >= 2:
                 cooperation_reward += 0.2
@@ -287,6 +482,8 @@ class ClusterEnv:
             "failures": [s.is_failed for s in self.servers],
             "freqs": [s.current_freq for s in self.servers],
             "redirects_this_step": len([r for r in self.redirect_log if r["step"] == self.time_step - 1]),
+            "migrations_this_step": len(migration_info),
+            "overload_counters": [s.sustained_overload_counter for s in self.servers],
         }
 
         return self._get_obs(), {"total": total_reward, "per_server": rewards_per_server}, done, info
@@ -309,7 +506,6 @@ class ClusterEnv:
         total_capacity = sum(self.max_queue for _ in active_indices)
         system_load_ratio = total_queue / max(total_capacity, 1)
 
-        # 高负载时增大指数(1.5→4.0), 增强均衡效果
         dynamic_exponent = 1.5 + 2.5 * system_load_ratio
 
         weights = []
@@ -348,6 +544,8 @@ class ClusterEnv:
                     if active:
                         shortest_idx = min(active, key=lambda j: self.servers[j].queue_length)
                         self.servers[shortest_idx].queue_length += count
+                        self.servers[shortest_idx].request_sources[-1] = \
+                            self.servers[shortest_idx].request_sources.get(-1, 0) + count
                         self.redirect_log.append({
                             "step": self.time_step,
                             "from": i,
@@ -360,6 +558,9 @@ class ClusterEnv:
                         self.servers[i].queue_length += count
                 else:
                     self.servers[i].queue_length += count
+                    # 记录为本地请求
+                    self.servers[i].request_sources[-1] = \
+                        self.servers[i].request_sources.get(-1, 0) + count
 
     def _simulate_failures(self):
         for i, server in enumerate(self.servers):

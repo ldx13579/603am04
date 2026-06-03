@@ -51,17 +51,26 @@ class SharedReplayBuffer:
 
 
 class CentralizedMADQN:
-    """集中式多智能体DQN: 共享经验池, 多头Q网络, 联合状态输入"""
+    """集中式多智能体Double DQN
 
-    def __init__(self, joint_state_dim=14, num_servers=3, action_per_server=3,
+    特性:
+    - 共享经验池
+    - 多头Q网络 (共享编码器 + 独立动作头)
+    - Double DQN: policy_net选动作, target_net估值, 减少过估计
+    - 同步更新策略网络和目标网络
+    """
+
+    def __init__(self, joint_state_dim=20, num_servers=3, action_per_server=6,
                  hidden_dim=256, lr=1e-3, gamma=0.99,
                  epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=800,
-                 buffer_size=50000, batch_size=128, target_update_freq=300):
+                 buffer_size=50000, batch_size=128, target_update_freq=300,
+                 soft_update_tau=0.005):
         self.num_servers = num_servers
         self.action_per_server = action_per_server
         self.gamma = gamma
         self.batch_size = batch_size
         self.target_update_freq = target_update_freq
+        self.soft_update_tau = soft_update_tau
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
@@ -110,14 +119,19 @@ class CentralizedMADQN:
         dones_t = torch.FloatTensor(dones).to(self.device)
 
         q_heads = self.policy_net(states_t)
+
+        # Double DQN: policy_net选择最优动作, target_net评估其Q值
         with torch.no_grad():
-            next_q_heads = self.target_net(next_states_t)
+            next_q_policy_heads = self.policy_net(next_states_t)
+            next_q_target_heads = self.target_net(next_states_t)
 
         total_loss = torch.tensor(0.0, device=self.device)
         for i in range(self.num_servers):
             q_values = q_heads[i].gather(1, actions_t[:, i].unsqueeze(1)).squeeze(1)
-            next_q_max = next_q_heads[i].max(1)[0]
-            target = rewards_t + self.gamma * next_q_max * (1 - dones_t)
+            # Double DQN: argmax来自policy, 值来自target
+            best_next_actions = next_q_policy_heads[i].argmax(dim=1, keepdim=True)
+            next_q_value = next_q_target_heads[i].gather(1, best_next_actions).squeeze(1)
+            target = rewards_t + self.gamma * next_q_value * (1 - dones_t)
             total_loss += nn.MSELoss()(q_values, target)
 
         self.optimizer.zero_grad()
@@ -125,11 +139,21 @@ class CentralizedMADQN:
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
 
+        # 同步软更新目标网络 (每步都微小更新, 减少训练波动)
         self.learn_steps += 1
-        if self.learn_steps % self.target_update_freq == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
+        self._sync_target_network()
 
         return total_loss.item() / self.num_servers
+
+    def _sync_target_network(self):
+        """软更新(Polyak averaging)使目标网络平滑跟踪策略网络"""
+        tau = self.soft_update_tau
+        for target_param, policy_param in zip(
+            self.target_net.parameters(), self.policy_net.parameters()
+        ):
+            target_param.data.copy_(
+                tau * policy_param.data + (1.0 - tau) * target_param.data
+            )
 
     def save(self, path):
         torch.save({
@@ -150,13 +174,15 @@ class CentralizedMADQN:
 
 
 class IndependentDQN:
-    """独立DQN: 每个服务器独立网络和缓冲区"""
+    """独立Double DQN: 每个服务器独立网络和缓冲区, 同步目标网络更新"""
 
-    def __init__(self, num_servers=3, local_state_dim=6, action_dim=3,
+    def __init__(self, num_servers=3, local_state_dim=14, action_dim=6,
                  hidden_dim=128, lr=1e-3, gamma=0.99,
                  epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=800,
-                 buffer_size=10000, batch_size=64, target_update_freq=200):
+                 buffer_size=10000, batch_size=64, target_update_freq=200,
+                 soft_update_tau=0.005):
         self.num_servers = num_servers
+        self.soft_update_tau = soft_update_tau
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.agents = []
@@ -164,7 +190,8 @@ class IndependentDQN:
             agent = SingleAgentDQN(
                 local_state_dim, action_dim, hidden_dim,
                 lr, gamma, epsilon_start, epsilon_end, epsilon_decay,
-                buffer_size, batch_size, target_update_freq, self.device
+                buffer_size, batch_size, target_update_freq,
+                soft_update_tau, self.device
             )
             self.agents.append(agent)
 
@@ -188,23 +215,31 @@ class IndependentDQN:
             losses.append(loss)
         return losses
 
+    def sync_all_targets(self):
+        """同步所有智能体的目标网络 (在同一时刻更新, 减少训练波动)"""
+        for agent in self.agents:
+            agent.sync_target()
+
     def save(self, path):
         data = {}
         for i, agent in enumerate(self.agents):
-            data[f"agent_{i}"] = agent.policy_net.state_dict()
+            data[f"agent_{i}_policy"] = agent.policy_net.state_dict()
+            data[f"agent_{i}_target"] = agent.target_net.state_dict()
         torch.save(data, path)
 
 
 class SingleAgentDQN:
-    """单个独立DQN Agent"""
+    """单个独立Double DQN Agent"""
 
     def __init__(self, state_dim, action_dim, hidden_dim,
                  lr, gamma, epsilon_start, epsilon_end, epsilon_decay,
-                 buffer_size, batch_size, target_update_freq, device):
+                 buffer_size, batch_size, target_update_freq,
+                 soft_update_tau, device):
         self.action_dim = action_dim
         self.gamma = gamma
         self.batch_size = batch_size
         self.target_update_freq = target_update_freq
+        self.soft_update_tau = soft_update_tau
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
@@ -254,9 +289,12 @@ class SingleAgentDQN:
         dones_t = torch.FloatTensor(dones).to(self.device)
 
         q_values = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+
+        # Double DQN: policy_net选动作, target_net评估
         with torch.no_grad():
-            next_q_max = self.target_net(next_states_t).max(1)[0]
-            target = rewards_t + self.gamma * next_q_max * (1 - dones_t)
+            best_next_actions = self.policy_net(next_states_t).argmax(dim=1, keepdim=True)
+            next_q_value = self.target_net(next_states_t).gather(1, best_next_actions).squeeze(1)
+            target = rewards_t + self.gamma * next_q_value * (1 - dones_t)
 
         loss = nn.MSELoss()(q_values, target)
 
@@ -265,8 +303,18 @@ class SingleAgentDQN:
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
 
+        # 软更新目标网络
         self.learn_steps += 1
-        if self.learn_steps % self.target_update_freq == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.sync_target()
 
         return loss.item()
+
+    def sync_target(self):
+        """软更新目标网络"""
+        tau = self.soft_update_tau
+        for target_param, policy_param in zip(
+            self.target_net.parameters(), self.policy_net.parameters()
+        ):
+            target_param.data.copy_(
+                tau * policy_param.data + (1.0 - tau) * target_param.data
+            )

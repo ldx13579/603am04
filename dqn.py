@@ -104,9 +104,10 @@ class DQNAgent:
         # 当前Q值
         q_values = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
 
-        # 目标Q值
+        # Double DQN: policy_net选动作, target_net估值, 减少过估计
         with torch.no_grad():
-            next_q_values = self.target_net(next_states_t).max(1)[0]
+            best_next_actions = self.policy_net(next_states_t).argmax(dim=1, keepdim=True)
+            next_q_values = self.target_net(next_states_t).gather(1, best_next_actions).squeeze(1)
             target_q_values = rewards_t + self.gamma * next_q_values * (1 - dones_t)
 
         loss = nn.MSELoss()(q_values, target_q_values)
