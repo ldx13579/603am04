@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DQN Cloud Controller Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        .header {
+            background: #16213e;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #0f3460;
+        }
+        .header h1 {
+            font-size: 20px;
+            color: #4fc3f7;
+        }
+        .status-bar {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+        }
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+        }
+        .status-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #666;
+        }
+        .status-dot.connected { background: #4caf50; }
+        .status-dot.running { background: #ff9800; animation: pulse 1s infinite; }
+        @keyframes pulse { 50% { opacity: 0.5; } }
+
+        .controls {
+            background: #16213e;
+            padding: 12px 24px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            border-bottom: 1px solid #0f3460;
+        }
+        .controls button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: opacity 0.2s;
+        }
+        .controls button:hover { opacity: 0.85; }
+        .btn-start { background: #4caf50; color: white; }
+        .btn-stop { background: #f44336; color: white; }
+        .btn-adapt { background: #ff9800; color: white; }
+        .controls select, .controls input {
+            padding: 6px 10px;
+            background: #1a1a2e;
+            border: 1px solid #0f3460;
+            color: #e0e0e0;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+            padding: 16px 24px;
+        }
+        .stat-card {
+            background: #16213e;
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+        }
+        .stat-card .label { font-size: 12px; color: #888; margin-bottom: 4px; }
+        .stat-card .value { font-size: 24px; font-weight: 600; color: #4fc3f7; }
+        .stat-card .unit { font-size: 12px; color: #666; margin-left: 4px; }
+        .stat-card.saving .value { color: #4caf50; }
+
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            padding: 0 24px 16px;
+        }
+        .chart-panel {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 16px;
+            border: 1px solid #0f3460;
+        }
+        .chart-panel h3 {
+            font-size: 14px;
+            color: #bbb;
+            margin-bottom: 12px;
+        }
+        .chart-container { position: relative; height: 220px; }
+
+        .log-section {
+            padding: 0 24px 24px;
+        }
+        .log-section h3 {
+            font-size: 14px;
+            color: #bbb;
+            margin-bottom: 8px;
+        }
+        .log-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .log-table th {
+            background: #0f3460;
+            padding: 8px;
+            text-align: left;
+            color: #4fc3f7;
+        }
+        .log-table td {
+            padding: 6px 8px;
+            border-bottom: 1px solid #1a1a2e;
+        }
+        .log-table tr:hover { background: #1a1a2e; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>DQN Cloud Controller - Real-time Dashboard</h1>
+        <div class="status-bar">
+            <div class="status-indicator">
+                <div class="status-dot" id="wsDot"></div>
+                <span id="wsStatus">Disconnected</span>
+            </div>
+            <div class="status-indicator">
+                <div class="status-dot" id="simDot"></div>
+                <span id="simStatus">Idle</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button class="btn-start" onclick="startSim()">Start Simulation</button>
+        <button class="btn-stop" onclick="stopSim()">Stop</button>
+        <select id="patternSelect">
+            <option value="normal">Normal Load</option>
+            <option value="double11">Double-11 Flash</option>
+        </select>
+        <label>Speed: <input type="number" id="speedInput" value="2" min="0.1" max="20" step="0.5" style="width:60px"></label>
+        <button class="btn-adapt" onclick="triggerAdapt()">Meta-Adapt</button>
+    </div>
+
+    <div class="stats-row">
+        <div class="stat-card">
+            <div class="label">Total Power</div>
+            <div class="value" id="statPower">0<span class="unit">W</span></div>
+        </div>
+        <div class="stat-card saving">
+            <div class="label">Energy Saving</div>
+            <div class="value" id="statSaving">0<span class="unit">%</span></div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Avg Response Time</div>
+            <div class="value" id="statResp">0<span class="unit">ms</span></div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Migrations</div>
+            <div class="value" id="statMigrations">0</div>
+        </div>
+    </div>
+
+    <div class="charts-grid">
+        <div class="chart-panel">
+            <h3>Power Consumption (per server)</h3>
+            <div class="chart-container"><canvas id="chartPower"></canvas></div>
+        </div>
+        <div class="chart-panel">
+            <h3>DQN vs Baseline Power Comparison</h3>
+            <div class="chart-container"><canvas id="chartComparison"></canvas></div>
+        </div>
+        <div class="chart-panel">
+            <h3>Queue Lengths</h3>
+            <div class="chart-container"><canvas id="chartQueues"></canvas></div>
+        </div>
+        <div class="chart-panel">
+            <h3>Migration Events</h3>
+            <div class="chart-container"><canvas id="chartMigrations"></canvas></div>
+        </div>
+    </div>
+
+    <div class="log-section">
+        <h3>Decision Log (recent 20)</h3>
+        <table class="log-table">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Step</th>
+                    <th>Actions</th>
+                    <th>Power(W)</th>
+                    <th>Queues</th>
+                    <th>Reward</th>
+                </tr>
+            </thead>
+            <tbody id="logBody"></tbody>
+        </table>
+    </div>
+
+<script>
+const MAX_POINTS = 360;
+let ws = null;
+let stepCounter = 0;
+
+// Chart configurations
+const chartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 0 },
+    scales: {
+        x: { display: true, ticks: { color: '#666', maxTicksLimit: 8 }, grid: { color: '#2a2a4a' } },
+        y: { ticks: { color: '#666' }, grid: { color: '#2a2a4a' } }
+    },
+    plugins: { legend: { labels: { color: '#aaa', font: { size: 11 } } } }
+};
+
+const serverColors = ['#E53935', '#1E88E5', '#43A047'];
+const serverNames = ['High-Perf', 'Standard', 'Low-Power'];
+
+// Power chart
+const powerChart = new Chart(document.getElementById('chartPower'), {
+    type: 'line',
+    data: {
+        labels: [],
+        datasets: serverNames.map((name, i) => ({
+            label: name,
+            data: [],
+            borderColor: serverColors[i],
+            backgroundColor: 'transparent',
+            borderWidth: 1.5,
+            pointRadius: 0,
+            tension: 0.3
+        }))
+    },
+    options: { ...chartOptions, scales: { ...chartOptions.scales, y: { ...chartOptions.scales.y, title: { display: true, text: 'W', color: '#666' } } } }
+});
+
+// Comparison chart
+const compChart = new Chart(document.getElementById('chartComparison'), {
+    type: 'line',
+    data: {
+        labels: [],
+        datasets: [
+            { label: 'DQN Total', data: [], borderColor: '#4fc3f7', backgroundColor: 'rgba(79,195,247,0.1)', borderWidth: 2, pointRadius: 0, fill: true, tension: 0.3 },
+            { label: 'Baseline (70%)', data: [], borderColor: '#ff5252', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, borderDash: [5, 3], tension: 0.3 }
+        ]
+    },
+    options: chartOptions
+});
+
+// Queue chart
+const queueChart = new Chart(document.getElementById('chartQueues'), {
+    type: 'line',
+    data: {
+        labels: [],
+        datasets: [
+            ...serverNames.map((name, i) => ({
+                label: name,
+                data: [],
+                borderColor: serverColors[i],
+                backgroundColor: 'transparent',
+                borderWidth: 1.5,
+                pointRadius: 0,
+                tension: 0.3
+            })),
+            { label: 'SLA Threshold', data: [], borderColor: '#ffeb3b', borderWidth: 1, borderDash: [4, 4], pointRadius: 0 }
+        ]
+    },
+    options: chartOptions
+});
+
+// Migration chart
+const migChart = new Chart(document.getElementById('chartMigrations'), {
+    type: 'bar',
+    data: {
+        labels: [],
+        datasets: [{ label: 'Migrations', data: [], backgroundColor: '#9C27B0', borderWidth: 0 }]
+    },
+    options: { ...chartOptions, scales: { ...chartOptions.scales, y: { ...chartOptions.scales.y, beginAtZero: true } } }
+});
+
+function addDataPoint(metrics) {
+    stepCounter++;
+    const label = `${stepCounter}`;
+    const baseline = (300*0.7 + 200*0.7 + 120*0.7);
+
+    // Update stat cards
+    document.getElementById('statPower').innerHTML = `${metrics.total_power.toFixed(0)}<span class="unit">W</span>`;
+    document.getElementById('statSaving').innerHTML = `${metrics.energy_saving_pct.toFixed(1)}<span class="unit">%</span>`;
+    document.getElementById('statResp').innerHTML = `${(metrics.avg_response_time * 1000).toFixed(0)}<span class="unit">ms</span>`;
+    document.getElementById('statMigrations').innerHTML = `${metrics.migrations_this_step}`;
+
+    // Power chart
+    powerChart.data.labels.push(label);
+    metrics.powers.forEach((p, i) => powerChart.data.datasets[i].data.push(p));
+    trimChart(powerChart);
+    powerChart.update('none');
+
+    // Comparison chart
+    compChart.data.labels.push(label);
+    compChart.data.datasets[0].data.push(metrics.total_power);
+    compChart.data.datasets[1].data.push(baseline);
+    trimChart(compChart);
+    compChart.update('none');
+
+    // Queue chart
+    queueChart.data.labels.push(label);
+    metrics.queues.forEach((q, i) => queueChart.data.datasets[i].data.push(q));
+    queueChart.data.datasets[3].data.push(20);
+    trimChart(queueChart);
+    queueChart.update('none');
+
+    // Migration chart
+    migChart.data.labels.push(label);
+    migChart.data.datasets[0].data.push(metrics.migrations_this_step);
+    trimChart(migChart);
+    migChart.update('none');
+
+    // Decision log
+    updateLog(metrics);
+}
+
+function trimChart(chart) {
+    if (chart.data.labels.length > MAX_POINTS) {
+        chart.data.labels.shift();
+        chart.data.datasets.forEach(ds => ds.data.shift());
+    }
+}
+
+function updateLog(metrics) {
+    const body = document.getElementById('logBody');
+    const row = document.createElement('tr');
+    row.innerHTML = `
+        <td>${metrics.timestamp || new Date().toLocaleTimeString()}</td>
+        <td>${metrics.step}</td>
+        <td>${(metrics.action_names || []).join(', ')}</td>
+        <td>${metrics.total_power.toFixed(1)}</td>
+        <td>[${metrics.queues.join(', ')}]</td>
+        <td>${(metrics.reward || 0).toFixed(2)}</td>
+    `;
+    body.insertBefore(row, body.firstChild);
+    while (body.children.length > 20) body.removeChild(body.lastChild);
+}
+
+// WebSocket
+function connectWS() {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${protocol}//${location.host}/ws/realtime`);
+
+    ws.onopen = () => {
+        document.getElementById('wsDot').className = 'status-dot connected';
+        document.getElementById('wsStatus').textContent = 'Connected';
+    };
+
+    ws.onmessage = (event) => {
+        const metrics = JSON.parse(event.data);
+        addDataPoint(metrics);
+    };
+
+    ws.onclose = () => {
+        document.getElementById('wsDot').className = 'status-dot';
+        document.getElementById('wsStatus').textContent = 'Disconnected';
+        setTimeout(connectWS, 3000);
+    };
+
+    ws.onerror = () => ws.close();
+}
+
+// API calls
+async function startSim() {
+    const pattern = document.getElementById('patternSelect').value;
+    const speed = parseFloat(document.getElementById('speedInput').value) || 2;
+    const res = await fetch('/api/simulation/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pattern, speed })
+    });
+    if (res.ok) {
+        document.getElementById('simDot').className = 'status-dot running';
+        document.getElementById('simStatus').textContent = 'Running';
+    }
+}
+
+async function stopSim() {
+    await fetch('/api/simulation/stop', { method: 'POST' });
+    document.getElementById('simDot').className = 'status-dot';
+    document.getElementById('simStatus').textContent = 'Stopped';
+}
+
+async function triggerAdapt() {
+    const pattern = document.getElementById('patternSelect').value;
+    const res = await fetch(`/api/meta/adapt?pattern=${pattern}&episodes=5`, { method: 'POST' });
+    const data = await res.json();
+    alert(`Meta-adaptation complete: ${data.status}\nPattern: ${data.pattern}, Episodes: ${data.episodes}`);
+}
+
+// Init
+connectWS();
+</script>
+</body>
+</html>
