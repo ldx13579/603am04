@@ -230,10 +230,11 @@ class ClusterEnv:
         return self.migration_base_delay + int(load_ratio * 2)
 
     def _compute_dynamic_migration_count(self, action, source_idx, target_idx):
-        """根据源队列长度和目标剩余容量动态计算迁移数量
+        """根据源队列长度、目标剩余容量和服务器处理能力动态计算迁移数量
 
         base_fraction由动作决定基础迁移强度
-        实际迁移量 = base_fraction * src_queue * (target_remaining / max_queue)
+        processing_weight = target_service_rate / src_service_rate (目标处理能力越强分配越多)
+        实际迁移量 = base_fraction * src_queue * capacity_ratio * processing_weight
         """
         base_fractions = {3: 0.2, 4: 0.4, 5: 0.6}
         base_frac = base_fractions[action]
@@ -242,8 +243,23 @@ class ClusterEnv:
         target_remaining = self.max_queue - self.servers[target_idx].queue_length
         target_capacity_ratio = target_remaining / self.max_queue
 
-        # 动态比例: 源越满迁移动机越强, 目标越空接收能力越大
-        effective_frac = base_frac * (src_queue / self.max_queue) * target_capacity_ratio
+        # 计算处理能力权重: 目标服务速率 / 源服务速率
+        src_cfg = self.server_configs[source_idx]
+        tgt_cfg = self.server_configs[target_idx]
+        src_server = self.servers[source_idx]
+        tgt_server = self.servers[target_idx]
+
+        src_rate = (src_cfg["base_service_rate"]
+                    * src_cfg["freq_multipliers"][src_server.current_freq]
+                    * src_server.get_service_rate_factor())
+        tgt_rate = (tgt_cfg["base_service_rate"]
+                    * tgt_cfg["freq_multipliers"][tgt_server.current_freq]
+                    * tgt_server.get_service_rate_factor())
+        # 处理能力权重: 目标越强则迁移越多, 钳位在[0.5, 2.0]避免极端值
+        processing_weight = np.clip(tgt_rate / max(src_rate, 1e-6), 0.5, 2.0)
+
+        # 动态比例: 源越满 × 目标越空 × 目标处理能力越强 → 迁移越多
+        effective_frac = base_frac * (src_queue / self.max_queue) * target_capacity_ratio * processing_weight
         migrate_count = max(1, int(src_queue * effective_frac))
         migrate_count = min(migrate_count, src_queue, target_remaining)
         return migrate_count
@@ -445,6 +461,21 @@ class ClusterEnv:
                 # 过早迁移惩罚: 过载计数不足时不该迁移
                 if server.sustained_overload_counter < 2:
                     r -= 1.0
+
+            # 基于请求来源的差异化奖励
+            # 本地请求处理优先: 本地占比高时给予奖励(鼓励就地处理)
+            # 迁入请求积压惩罚: 迁入占比高时额外惩罚(避免成为迁移黑洞)
+            local_ratio = server.get_local_request_ratio()
+            migrated_in_count = sum(
+                v for k, v in server.request_sources.items() if k != -1
+            )
+            if server.queue_length > 0:
+                # 本地请求占比高 → 奖励 (鼓励本地高效处理)
+                r += 0.2 * local_ratio
+                # 迁入请求过多时惩罚 (防止某服务器成为迁移汇聚点)
+                migrated_ratio = migrated_in_count / max(server.queue_length, 1)
+                if migrated_ratio > 0.5 and server.queue_length > self.sla_threshold:
+                    r -= 0.5 * migrated_ratio
 
             rewards_per_server.append(r)
 

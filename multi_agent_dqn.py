@@ -64,13 +64,17 @@ class CentralizedMADQN:
                  hidden_dim=256, lr=1e-3, gamma=0.99,
                  epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=800,
                  buffer_size=50000, batch_size=128, target_update_freq=300,
-                 soft_update_tau=0.005):
+                 soft_update_tau=0.005, tau_start=0.01, tau_end=0.001,
+                 tau_decay_steps=50000):
         self.num_servers = num_servers
         self.action_per_server = action_per_server
         self.gamma = gamma
         self.batch_size = batch_size
         self.target_update_freq = target_update_freq
         self.soft_update_tau = soft_update_tau
+        self.tau_start = tau_start
+        self.tau_end = tau_end
+        self.tau_decay_steps = tau_decay_steps
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
@@ -145,9 +149,14 @@ class CentralizedMADQN:
 
         return total_loss.item() / self.num_servers
 
+    def _get_adaptive_tau(self):
+        """根据训练进度动态调整Polyak参数: 初期较快更新, 后期较慢更新"""
+        progress = min(1.0, self.learn_steps / max(self.tau_decay_steps, 1))
+        return self.tau_start + (self.tau_end - self.tau_start) * progress
+
     def _sync_target_network(self):
-        """软更新(Polyak averaging)使目标网络平滑跟踪策略网络"""
-        tau = self.soft_update_tau
+        """自适应软更新: tau随训练进度从tau_start衰减到tau_end"""
+        tau = self._get_adaptive_tau()
         for target_param, policy_param in zip(
             self.target_net.parameters(), self.policy_net.parameters()
         ):
@@ -229,17 +238,21 @@ class IndependentDQN:
 
 
 class SingleAgentDQN:
-    """单个独立Double DQN Agent"""
+    """单个独立Double DQN Agent (自适应Polyak tau)"""
 
     def __init__(self, state_dim, action_dim, hidden_dim,
                  lr, gamma, epsilon_start, epsilon_end, epsilon_decay,
                  buffer_size, batch_size, target_update_freq,
-                 soft_update_tau, device):
+                 soft_update_tau, device,
+                 tau_start=0.01, tau_end=0.001, tau_decay_steps=30000):
         self.action_dim = action_dim
         self.gamma = gamma
         self.batch_size = batch_size
         self.target_update_freq = target_update_freq
         self.soft_update_tau = soft_update_tau
+        self.tau_start = tau_start
+        self.tau_end = tau_end
+        self.tau_decay_steps = tau_decay_steps
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
@@ -309,9 +322,14 @@ class SingleAgentDQN:
 
         return loss.item()
 
+    def _get_adaptive_tau(self):
+        """根据训练进度动态调整tau: 初期快速跟踪, 后期稳定"""
+        progress = min(1.0, self.learn_steps / max(self.tau_decay_steps, 1))
+        return self.tau_start + (self.tau_end - self.tau_start) * progress
+
     def sync_target(self):
-        """软更新目标网络"""
-        tau = self.soft_update_tau
+        """自适应软更新目标网络"""
+        tau = self._get_adaptive_tau()
         for target_param, policy_param in zip(
             self.target_net.parameters(), self.policy_net.parameters()
         ):
