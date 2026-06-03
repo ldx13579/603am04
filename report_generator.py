@@ -32,11 +32,17 @@ plt.rcParams['axes.unicode_minus'] = False
 
 
 class ReportGenerator:
-    """综合实验报告生成器"""
+    """综合实验报告生成器
+
+    支持两种模式:
+    1. 传入已训练的agent和rewards (在训练脚本中调用)
+    2. 从.pth文件加载预训练模型 (避免重复训练)
+    """
 
     def __init__(self, train_trace=None, test_trace=None,
                  madqn_agent=None, idqn_agent=None,
-                 madqn_rewards=None, idqn_rewards=None):
+                 madqn_rewards=None, idqn_rewards=None,
+                 madqn_model_path=None, idqn_model_path=None):
         self.train_trace = train_trace
         self.test_trace = test_trace
         self.madqn_agent = madqn_agent
@@ -44,6 +50,48 @@ class ReportGenerator:
         self.madqn_rewards = madqn_rewards or []
         self.idqn_rewards = idqn_rewards or []
         self.results = {}
+
+        if self.train_trace is None:
+            trace_gen = AlibabaTraceGenerator(duration_hours=24, seed=42)
+            self.train_trace = trace_gen.generate_trace()
+        if self.test_trace is None:
+            test_gen = AlibabaTraceGenerator(duration_hours=24, seed=123)
+            self.test_trace = test_gen.generate_trace()
+
+        if madqn_model_path and self.madqn_agent is None:
+            self.madqn_agent = self._load_madqn(madqn_model_path)
+        if idqn_model_path and self.idqn_agent is None:
+            self.idqn_agent = self._load_idqn(idqn_model_path)
+
+    def _load_madqn(self, path):
+        """从文件加载预训练CentralizedMADQN"""
+        from multi_agent_dqn import CentralizedMADQN
+        env = ClusterEnv(trace=self.train_trace, seed=42)
+        agent = CentralizedMADQN(
+            joint_state_dim=env.joint_state_dim,
+            num_servers=env.num_servers,
+            action_per_server=env.action_dim,
+        )
+        agent.load(path)
+        print(f"[Report] 已加载MADDQN模型: {path}")
+        return agent
+
+    def _load_idqn(self, path):
+        """从文件加载预训练IndependentDQN"""
+        import torch
+        from multi_agent_dqn import IndependentDQN
+        env = ClusterEnv(trace=self.train_trace, seed=42)
+        agent = IndependentDQN(
+            num_servers=env.num_servers,
+            local_state_dim=env.local_state_dim,
+            action_dim=env.action_dim,
+        )
+        data = torch.load(path, weights_only=True)
+        for i, a in enumerate(agent.agents):
+            a.policy_net.load_state_dict(data[f"agent_{i}_policy"])
+            a.target_net.load_state_dict(data[f"agent_{i}_target"])
+        print(f"[Report] 已加载IDDQN模型: {path}")
+        return agent
 
     def analyze_convergence(self):
         """训练收敛速度分析"""
@@ -579,21 +627,43 @@ class ReportGenerator:
 
 
 if __name__ == "__main__":
-    print("Training models for report generation...")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate experiment report")
+    parser.add_argument("--madqn-model", default=None,
+                        help="Path to pre-trained MADDQN .pth file (skip training)")
+    parser.add_argument("--idqn-model", default=None,
+                        help="Path to pre-trained IDDQN .pth file (skip training)")
+    parser.add_argument("--episodes", type=int, default=1000,
+                        help="Training episodes (if not loading models)")
+    parser.add_argument("--output", default=".", help="Output directory")
+    args = parser.parse_args()
+
     trace_gen = AlibabaTraceGenerator(duration_hours=24, seed=42)
     train_trace = trace_gen.generate_trace()
     test_gen = AlibabaTraceGenerator(duration_hours=24, seed=123)
     test_trace = test_gen.generate_trace()
 
-    print("\nTraining MADDQN...")
-    madqn_agent, madqn_rewards, _ = train_centralized_madqn(
-        train_trace, num_episodes=1000, use_tensorboard=False
-    )
+    madqn_agent = None
+    idqn_agent = None
+    madqn_rewards = []
+    idqn_rewards = []
 
-    print("\nTraining IDDQN...")
-    idqn_agent, idqn_rewards = train_independent_dqn(
-        train_trace, num_episodes=1000, use_tensorboard=False
-    )
+    if args.madqn_model:
+        print(f"Loading pre-trained MADDQN from: {args.madqn_model}")
+    else:
+        print(f"\nTraining MADDQN ({args.episodes} episodes)...")
+        madqn_agent, madqn_rewards, _ = train_centralized_madqn(
+            train_trace, num_episodes=args.episodes, use_tensorboard=False
+        )
+
+    if args.idqn_model:
+        print(f"Loading pre-trained IDDQN from: {args.idqn_model}")
+    else:
+        print(f"\nTraining IDDQN ({args.episodes} episodes)...")
+        idqn_agent, idqn_rewards = train_independent_dqn(
+            train_trace, num_episodes=args.episodes, use_tensorboard=False
+        )
 
     report = ReportGenerator(
         train_trace=train_trace,
@@ -602,5 +672,7 @@ if __name__ == "__main__":
         idqn_agent=idqn_agent,
         madqn_rewards=madqn_rewards,
         idqn_rewards=idqn_rewards,
+        madqn_model_path=args.madqn_model,
+        idqn_model_path=args.idqn_model,
     )
-    report.run_all()
+    report.run_all(output_dir=args.output)

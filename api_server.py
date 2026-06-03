@@ -14,12 +14,13 @@ from datetime import datetime
 from collections import deque
 from typing import List, Optional
 from contextlib import asynccontextmanager
+import threading
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from cluster_env import ClusterEnv
 from multi_agent_dqn import CentralizedMADQN
@@ -33,6 +34,27 @@ class LoadData(BaseModel):
     server_loads: List[float]
     timestamp: Optional[str] = None
     request_counts: Optional[List[int]] = None
+    sequence_id: Optional[int] = None
+    expected_queues: Optional[List[int]] = None
+
+    @field_validator('server_loads')
+    @classmethod
+    def validate_loads(cls, v):
+        if not v:
+            raise ValueError("server_loads cannot be empty")
+        for load in v:
+            if not (0.0 <= load <= 1.0):
+                raise ValueError(f"server_load must be in [0, 1], got {load}")
+        return v
+
+    @field_validator('request_counts')
+    @classmethod
+    def validate_request_counts(cls, v):
+        if v is not None:
+            for count in v:
+                if count < 0:
+                    raise ValueError(f"request_count must be >= 0, got {count}")
+        return v
 
 class ActionResponse(BaseModel):
     actions: List[int]
@@ -81,7 +103,8 @@ class ControllerState:
 
         self.decision_log: deque = deque(maxlen=1000)
         self.metrics_history: deque = deque(maxlen=360)
-        self.websocket_clients: List[WebSocket] = []
+        self.websocket_clients: set = set()
+        self._ws_lock = asyncio.Lock()
 
         self.is_running: bool = False
         self.simulation_task: Optional[asyncio.Task] = None
@@ -91,6 +114,13 @@ class ControllerState:
 
         self.current_trace: Optional[np.ndarray] = None
         self.current_obs: Optional[dict] = None
+
+        # 状态同步
+        self._sequence_counter: int = 0
+        self._state_lock = threading.Lock()
+
+        # 自动适应记录
+        self.auto_adapt_log: deque = deque(maxlen=100)
 
     def initialize(self, model_path: Optional[str] = None):
         """初始化环境和agent"""
@@ -116,10 +146,14 @@ class ControllerState:
         else:
             self._quick_train()
 
-        self.meta_learner = ReptileMetaLearner(self.agent)
+        self.meta_learner = ReptileMetaLearner(
+            self.agent, auto_detect=True,
+            detect_window=24, detect_threshold=2.5, detect_cooldown=12,
+        )
         self.current_step = 0
         self.total_energy_wh = 0.0
         self.baseline_energy_wh = 0.0
+        self._sequence_counter = 0
 
     def _quick_train(self):
         """快速训练几个episode以获取初始策略"""
@@ -142,86 +176,148 @@ class ControllerState:
 
         print("[Controller] 初始训练完成")
 
+    def validate_state_sync(self, data: 'LoadData') -> Optional[str]:
+        """验证客户端提交的状态与服务端是否一致
+
+        Returns:
+            None if valid, error message string if inconsistent
+        """
+        if data.sequence_id is not None:
+            expected_seq = self._sequence_counter
+            if data.sequence_id != expected_seq:
+                return (
+                    f"Sequence mismatch: client={data.sequence_id}, "
+                    f"server={expected_seq}. Client may have missed steps."
+                )
+
+        if data.expected_queues is not None and self.env is not None:
+            actual_queues = [s.queue_length for s in self.env.servers]
+            for i, (expected, actual) in enumerate(
+                zip(data.expected_queues, actual_queues)
+            ):
+                if abs(expected - actual) > 5:
+                    return (
+                        f"Queue state mismatch on server {i}: "
+                        f"client expects {expected}, actual is {actual}. "
+                        f"State divergence detected."
+                    )
+
+        if len(data.server_loads) != self.env.num_servers:
+            return (
+                f"Server count mismatch: got {len(data.server_loads)} loads, "
+                f"expected {self.env.num_servers}"
+            )
+
+        return None
+
     def step_environment(self, arrivals: Optional[int] = None):
         """推进环境一步, 返回指标"""
         if self.current_obs is None:
             return None
 
-        joint_state = self.current_obs["joint_state"]
-        actions = self.agent.select_actions(joint_state, training=False)
+        with self._state_lock:
+            joint_state = self.current_obs["joint_state"]
+            actions = self.agent.select_actions(joint_state, training=False)
 
-        self.current_obs, rewards, done, info = self.env.step(actions)
+            self.current_obs, rewards, done, info = self.env.step(actions)
 
-        step_energy = info["total_power"] * (5.0 / 60.0)
-        self.total_energy_wh += step_energy
+            step_energy = info["total_power"] * (5.0 / 60.0)
+            self.total_energy_wh += step_energy
 
-        baseline_power = sum(
-            cfg["p_max"] * 0.7 for cfg in self.env.server_configs
-        )
-        self.baseline_energy_wh += baseline_power * (5.0 / 60.0)
-
-        energy_saving_pct = 0.0
-        if self.baseline_energy_wh > 0:
-            energy_saving_pct = (
-                (self.baseline_energy_wh - self.total_energy_wh)
-                / self.baseline_energy_wh * 100.0
+            baseline_power = sum(
+                cfg["p_max"] * 0.7 for cfg in self.env.server_configs
             )
+            self.baseline_energy_wh += baseline_power * (5.0 / 60.0)
 
-        now = datetime.now().isoformat(timespec='seconds')
-        metrics = {
-            "timestamp": now,
-            "step": self.current_step,
-            "powers": [round(p, 2) for p in info["powers"]],
-            "total_power": round(info["total_power"], 2),
-            "queues": info["queues"],
-            "freqs": info["freqs"],
-            "avg_response_time": round(info["avg_response_time"], 4),
-            "migrations_this_step": info["migrations_this_step"],
-            "energy_saving_pct": round(energy_saving_pct, 2),
-            "actions": actions,
-            "action_names": [ACTION_NAMES[a] for a in actions],
-            "reward": round(rewards["total"], 3),
-        }
+            energy_saving_pct = 0.0
+            if self.baseline_energy_wh > 0:
+                energy_saving_pct = (
+                    (self.baseline_energy_wh - self.total_energy_wh)
+                    / self.baseline_energy_wh * 100.0
+                )
 
-        self.metrics_history.append(metrics)
-        self.decision_log.append(DecisionLogEntry(
-            timestamp=now,
-            step=self.current_step,
-            state_summary={
+            # 自动模式检测: 输入总到达负载
+            total_load = sum(info["queues"])
+            if self.meta_learner:
+                adapted, new_agent = self.meta_learner.observe_and_adapt(
+                    total_load, self.agent
+                )
+                if adapted and new_agent is not None:
+                    self.agent = new_agent
+                    self.auto_adapt_log.append({
+                        "step": self.current_step,
+                        "timestamp": datetime.now().isoformat(timespec='seconds'),
+                        "drift_score": self.meta_learner.detector.drift_score,
+                        "total_adapts": self.meta_learner.auto_adapt_count,
+                    })
+
+            now = datetime.now().isoformat(timespec='seconds')
+            self._sequence_counter += 1
+
+            metrics = {
+                "timestamp": now,
+                "step": self.current_step,
+                "sequence_id": self._sequence_counter,
+                "powers": [round(p, 2) for p in info["powers"]],
+                "total_power": round(info["total_power"], 2),
                 "queues": info["queues"],
                 "freqs": info["freqs"],
-                "overload_counters": info["overload_counters"],
-            },
-            actions=actions,
-            action_names=[ACTION_NAMES[a] for a in actions],
-            reward=rewards["total"],
-            power=info["total_power"],
-        ))
+                "avg_response_time": round(info["avg_response_time"], 4),
+                "migrations_this_step": info["migrations_this_step"],
+                "energy_saving_pct": round(energy_saving_pct, 2),
+                "actions": actions,
+                "action_names": [ACTION_NAMES[a] for a in actions],
+                "reward": round(rewards["total"], 3),
+            }
 
-        self.current_step += 1
+            self.metrics_history.append(metrics)
+            self.decision_log.append(DecisionLogEntry(
+                timestamp=now,
+                step=self.current_step,
+                state_summary={
+                    "queues": info["queues"],
+                    "freqs": info["freqs"],
+                    "overload_counters": info["overload_counters"],
+                },
+                actions=actions,
+                action_names=[ACTION_NAMES[a] for a in actions],
+                reward=rewards["total"],
+                power=info["total_power"],
+            ))
 
-        if done:
-            self.env.reset()
-            self.current_obs = self.env.reset()
-            self.current_step = 0
-            self.total_energy_wh = 0.0
-            self.baseline_energy_wh = 0.0
+            self.current_step += 1
+
+            if done:
+                self.current_obs = self.env.reset()
+                self.current_step = 0
+                self.total_energy_wh = 0.0
+                self.baseline_energy_wh = 0.0
 
         return metrics
 
+    async def add_websocket(self, websocket: WebSocket):
+        """注册WebSocket客户端"""
+        async with self._ws_lock:
+            self.websocket_clients.add(websocket)
+
+    async def remove_websocket(self, websocket: WebSocket):
+        """移除WebSocket客户端并清理资源"""
+        async with self._ws_lock:
+            self.websocket_clients.discard(websocket)
+
     async def broadcast_metrics(self, metrics: dict):
         """WebSocket广播指标到所有连接的客户端"""
-        if not self.websocket_clients:
-            return
-        message = json.dumps(metrics, ensure_ascii=False)
-        disconnected = []
-        for ws in self.websocket_clients:
-            try:
-                await ws.send_text(message)
-            except Exception:
-                disconnected.append(ws)
-        for ws in disconnected:
-            self.websocket_clients.remove(ws)
+        async with self._ws_lock:
+            if not self.websocket_clients:
+                return
+            message = json.dumps(metrics, ensure_ascii=False)
+            stale = set()
+            for ws in self.websocket_clients:
+                try:
+                    await ws.send_text(message)
+                except Exception:
+                    stale.add(ws)
+            self.websocket_clients -= stale
 
 
 # ========================= Application =========================
@@ -250,7 +346,25 @@ app = FastAPI(
 
 @app.post("/api/load", response_model=MetricsResponse)
 async def receive_load(data: LoadData):
-    """接收实时负载数据 (模拟Prometheus采集), 推进环境并返回指标"""
+    """接收实时负载数据 (模拟Prometheus采集), 推进环境并返回指标
+
+    支持状态同步校验:
+    - sequence_id: 客户端期望的步序号, 不一致时返回400
+    - expected_queues: 客户端预期的队列状态, 偏差过大时返回409
+    """
+    sync_error = state.validate_state_sync(data)
+    if sync_error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "state_sync_failed",
+                "message": sync_error,
+                "server_step": state.current_step,
+                "server_sequence": state._sequence_counter,
+                "server_queues": [s.queue_length for s in state.env.servers],
+            },
+        )
+
     if data.request_counts:
         for i, count in enumerate(data.request_counts[:len(state.env.servers)]):
             state.env.servers[i].queue_length = min(
@@ -361,15 +475,24 @@ async def stop_simulation():
 # ========================= Meta-Learning =========================
 
 @app.post("/api/meta/adapt")
-async def trigger_adaptation(pattern: str = "double11", episodes: int = 5):
-    """触发元学习快速适应"""
+async def trigger_adaptation(pattern: str = "double11", episodes: int = 5,
+                             duration_hours: int = 1):
+    """触发元学习快速适应
+
+    Args:
+        pattern: 负载模式 ("double11" 或 "normal")
+        episodes: 微调episode数
+        duration_hours: 适应数据时长(小时), 支持1-72小时
+    """
     if state.meta_learner is None:
         return {"status": "error", "message": "meta_learner not initialized"}
 
+    duration_hours = max(1, min(duration_hours, 72))
+
     if pattern == "double11":
-        gen = Double11TraceGenerator(duration_hours=1, seed=None)
+        gen = Double11TraceGenerator(duration_hours=duration_hours, seed=None)
     else:
-        gen = AlibabaTraceGenerator(duration_hours=1, seed=None)
+        gen = AlibabaTraceGenerator(duration_hours=duration_hours, seed=None)
 
     new_trace = gen.generate_trace()
     adapted_agent = state.meta_learner.fast_adapt(new_trace, adaptation_episodes=episodes)
@@ -379,7 +502,26 @@ async def trigger_adaptation(pattern: str = "double11", episodes: int = 5):
         "status": "adapted",
         "pattern": pattern,
         "episodes": episodes,
+        "duration_hours": duration_hours,
         "trace_steps": len(new_trace),
+    }
+
+
+@app.get("/api/meta/status")
+async def meta_status():
+    """获取元学习器状态 (自动适应记录)"""
+    if state.meta_learner is None:
+        return {"status": "not_initialized"}
+
+    return {
+        "auto_detect_enabled": state.meta_learner.auto_detect,
+        "auto_adapt_count": state.meta_learner.auto_adapt_count,
+        "total_adaptations": len(state.meta_learner.adaptation_history),
+        "recent_auto_adapts": list(state.auto_adapt_log)[-10:],
+        "detector_drift_score": (
+            state.meta_learner.detector.drift_score
+            if state.meta_learner.detector else 0
+        ),
     }
 
 
@@ -387,15 +529,22 @@ async def trigger_adaptation(pattern: str = "double11", episodes: int = 5):
 
 @app.websocket("/ws/realtime")
 async def websocket_endpoint(websocket: WebSocket):
-    """实时指标推送WebSocket"""
+    """实时指标推送WebSocket (含连接清理)"""
     await websocket.accept()
-    state.websocket_clients.append(websocket)
+    await state.add_websocket(websocket)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        if websocket in state.websocket_clients:
-            state.websocket_clients.remove(websocket)
+        pass
+    except Exception:
+        pass
+    finally:
+        await state.remove_websocket(websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ========================= Dashboard =========================
